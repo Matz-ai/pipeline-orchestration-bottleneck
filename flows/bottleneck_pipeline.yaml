@@ -1,0 +1,286 @@
+# Pipeline mensuel BottleNeck : rapport CA + extractions des vins.
+# Kestra orchestre, les scripts de scripts/ font les traitements.
+# Chaque tâche est suivie de sa tâche de test ; un test KO arrête le flow.
+
+id: bottleneck_pipeline
+namespace: bottleneck
+
+description: |
+  Pipeline mensuel BottleNeck : ingestion des exports ERP, CMS et liaison,
+  nettoyage et dédoublonnage DuckDB, fusion, CA par produit et CA total,
+  détection des vins millésimes (z-score > 2), puis export du rapport CA
+  (.xlsx) et des listes de vins millésimes / ordinaires (.csv).
+  Chaque étape est suivie d'une tâche de test.
+
+labels:
+  projet: bottleneck
+
+# taskRunner Process : les scripts tournent dans le conteneur Kestra (Python et DuckDB installés dans l'image).
+# Retry des tâches nominales : 3 essais à 1 min d'écart. Les tests ne sont pas relancés.
+# Tâches séquentielles jusqu'au z-score : DuckDB n'accepte qu'un écrivain à la fois.
+
+tasks:
+  # T0 · Ingestion
+  - id: ingest
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: 3 fichiers .xlsx → raw_erp, raw_liaison, raw_web
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - python {{ envs.scripts_dir }}/python/ingest.py
+
+  - id: test_ingest
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: colonnes attendues, volumes bruts (825 / 825 / 1 513)
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_ingest
+
+  # T1 → T4 · Nettoyage et dédoublonnage (SQL DuckDB)
+  - id: clean_erp
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: raw_erp → erp_dedup (dédoublonnage sur product_id)
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/01_clean_erp.sql
+
+  - id: test_clean_erp
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: product_id unique, 825 lignes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_clean_erp
+
+  - id: clean_liaison
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: raw_liaison → liaison_dedup (dédoublonnage sur product_id)
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/02_clean_liaison.sql
+
+  - id: test_clean_liaison
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: product_id et id_web uniques, 825 lignes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_clean_liaison
+
+  - id: clean_web
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: raw_web → web_nettoye (suppression des valeurs manquantes)
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/03_clean_web.sql
+
+  - id: test_clean_web
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: 0 sku manquant, 1 428 lignes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_clean_web
+
+  - id: dedup_web
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: web_nettoye → web_dedup (dédoublonnage sur sku)
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/04_dedup_web.sql
+
+  - id: test_dedup_web
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: sku unique, 714 lignes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_dedup_web
+
+  # T5 · Fusion ERP ↔ web via la liaison
+  - id: merge
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: erp_dedup + liaison_dedup + web_dedup → fusion
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/05_merge.sql
+
+  - id: test_merge
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: fusion = web_dedup, clés uniques, 714 lignes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_merge
+
+  # T6 · Chiffre d'affaires
+  - id: compute_ca
+    type: io.kestra.plugin.scripts.shell.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: fusion → ca_par_produit, ca_total
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - duckdb {{ envs.duckdb_path }} -bail -f {{ envs.scripts_dir }}/sql/06_ca.sql
+
+  - id: test_ca
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: Σ CA par produit = CA total, aucun CA négatif, 70 568,60 €
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_ca
+
+  # T7 · Z-score (Python)
+  - id: zscore
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: fusion → vins_zscore + vues vins_millesimes / vins_ordinaires
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - python {{ envs.scripts_dir }}/python/zscore.py
+
+  - id: test_zscore
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: millésimes + ordinaires = fusion, 30 millésimes
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_zscore
+
+  # T8 · Export du rapport CA
+  # Le fichier est gardé dans Kestra (outputFiles) et copié dans data/outputs/.
+  - id: export_rapport_ca
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: ca_par_produit + ca_total → rapport .xlsx (2 onglets)
+    retry:
+      type: constant
+      interval: PT1M
+      maxAttempts: 3
+    commands:
+      - python {{ envs.scripts_dir }}/python/export_rapport_ca.py .
+      - cp *.xlsx {{ envs.data_output_dir }}/
+    outputFiles:
+      - "*.xlsx"
+
+  - id: test_export_rapport_ca
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    description: relit le .xlsx publié — 714 lignes, CA total 70 568,60 €
+    commands:
+      - python {{ envs.scripts_dir }}/tests/checks.py test_export_rapport_ca
+
+  # T9 · Branching : les 2 extractions en parallèle
+  - id: exports_vins
+    type: io.kestra.plugin.core.flow.Parallel
+    description: Extractions millésimes et ordinaires, en lecture seule, en parallèle
+    tasks:
+      - id: branche_millesimes
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: export_millesimes
+            type: io.kestra.plugin.scripts.python.Commands
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            description: vins_millesimes → .csv (Livrable 4)
+            retry:
+              type: constant
+              interval: PT1M
+              maxAttempts: 3
+            commands:
+              - python {{ envs.scripts_dir }}/python/export_vins.py millesimes .
+              - cp *.csv {{ envs.data_output_dir }}/
+            outputFiles:
+              - "*.csv"
+
+          - id: test_export_millesimes
+            type: io.kestra.plugin.scripts.python.Commands
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            description: relit le .csv publié — 30 lignes
+            commands:
+              - python {{ envs.scripts_dir }}/tests/checks.py test_export_millesimes
+
+      - id: branche_ordinaires
+        type: io.kestra.plugin.core.flow.Sequential
+        tasks:
+          - id: export_ordinaires
+            type: io.kestra.plugin.scripts.python.Commands
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            description: vins_ordinaires → .csv (Livrable 5)
+            retry:
+              type: constant
+              interval: PT1M
+              maxAttempts: 3
+            commands:
+              - python {{ envs.scripts_dir }}/python/export_vins.py ordinaires .
+              - cp *.csv {{ envs.data_output_dir }}/
+            outputFiles:
+              - "*.csv"
+
+          - id: test_export_ordinaires
+            type: io.kestra.plugin.scripts.python.Commands
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            description: relit le .csv publié — 684 lignes
+            commands:
+              - python {{ envs.scripts_dir }}/tests/checks.py test_export_ordinaires
+
+# Exécuté si une tâche échoue après ses retry, ou si un test est KO.
+errors:
+  - id: alerte_echec
+    type: io.kestra.plugin.core.log.Log
+    level: ERROR
+    message: |
+      ÉCHEC du pipeline BottleNeck — exécution {{ execution.id }}
+      Tâche en cause : {{ errorLogs()[0]['taskId'] ?? 'inconnue' }} (détail dans ses logs)
+      Les fichiers de ce mois ne doivent pas être diffusés. Corriger la cause,
+      puis relancer l'exécution (Restart) : elle reprend à la tâche en échec.
+
+# Le 15 de chaque mois à 9 h (heure de Paris)
+triggers:
+  - id: schedule_mensuel
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
+    timezone: Europe/Paris

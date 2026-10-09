@@ -1,0 +1,80 @@
+# Kestra en local : mode standalone, base H2 embarquée. Valeurs lues dans .env.
+
+name: bottleneck
+
+services:
+  kestra:
+    build:
+      context: .
+      dockerfile: docker/kestra/Dockerfile
+      args:
+        KESTRA_VERSION: ${KESTRA_VERSION:-v2.0.5}
+    image: bottleneck/kestra:${KESTRA_VERSION:-v2.0.5}
+    container_name: bottleneck-kestra
+    # standalone plutôt que `server local`, qui impose un port de management aléatoire (pas de healthcheck)
+    command: server standalone
+    stop_grace_period: 6m
+    ports:
+      - "${KESTRA_PORT:-8080}:8080"
+    environment:
+      KESTRA_CONFIGURATION: |
+        endpoints:
+          all:
+            port: 8081
+        datasources:
+          h2:
+            url: jdbc:h2:file:/app/data/database;TIME ZONE=UTC;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE;LOCK_TIMEOUT=30000
+            username: sa
+            password: ""
+            driverClassName: org.h2.Driver
+        kestra:
+          tutorial-flows:
+            enabled: false
+          url: ${KESTRA_UI_URL:-http://localhost:8080}
+          repository:
+            type: h2
+          queue:
+            type: h2
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          server:
+            basic-auth:
+              username: ${KESTRA_BASIC_AUTH_USERNAME:?remplir KESTRA_BASIC_AUTH_USERNAME dans .env}
+              password: ${KESTRA_BASIC_AUTH_PASSWORD:?remplir KESTRA_BASIC_AUTH_PASSWORD dans .env}
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+      # Variables ENV_* lisibles dans le flow via {{ envs.<nom> }}
+      ENV_DUCKDB_PATH: ${DUCKDB_PATH:-/bottleneck/data/warehouse.duckdb}
+      ENV_DATA_RAW_DIR: ${DATA_RAW_DIR:-/bottleneck/data/raw}
+      ENV_DATA_OUTPUT_DIR: ${DATA_OUTPUT_DIR:-/bottleneck/data/outputs}
+      ENV_SCRIPTS_DIR: /bottleneck/scripts
+      ENV_ZSCORE_THRESHOLD: ${ZSCORE_THRESHOLD:-2}
+      ENV_LIVRABLE_NOM: ${LIVRABLE_NOM:-}
+      ENV_LIVRABLE_PRENOM: ${LIVRABLE_PRENOM:-}
+      ENV_LIVRABLE_DATE: ${LIVRABLE_DATE:-}
+      TZ: ${SCHEDULE_TIMEZONE:-Europe/Paris}
+    volumes:
+      - kestra_storage:/app/storage
+      - kestra_db:/app/data
+      # /app/data est réservé à la base H2 de Kestra
+      - ./data:/bottleneck/data
+      - ./scripts:/bottleneck/scripts:ro
+      - ./flows:/bottleneck/flows:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8081/health', timeout=5)"
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+volumes:
+  kestra_storage:
+  kestra_db:
