@@ -4,6 +4,8 @@ Automatisation avec Kestra du nettoyage, de la réconciliation et de l'analyse
 des données ERP et CMS de BottleNeck : rapport mensuel du chiffre d'affaires
 et extractions des vins millésimes / ordinaires.
 
+![Diagramme de flux du pipeline](docs/diagramme-flux.png)
+
 Projet OpenClassrooms, parcours Data Engineer, « Mettez en place un pipeline
 d'orchestration des flux ».
 
